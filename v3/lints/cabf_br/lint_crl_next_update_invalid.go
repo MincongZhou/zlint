@@ -16,12 +16,12 @@ package cabf_br
 
 import (
 	"encoding/asn1"
+	"errors"
+	"fmt"
 
 	"github.com/zmap/zcrypto/x509"
 	"github.com/zmap/zlint/v3/lint"
 	"github.com/zmap/zlint/v3/util"
-
-	"fmt"
 )
 
 func init() {
@@ -71,8 +71,13 @@ func (l *CrlNextUpdateInvalid) Execute(c *x509.RevocationList) *lint.LintResult 
 	// certificates, that unambiguous in-band signal is preferred over the
 	// configuration default.
 	subscriberCRL := l.SubscriberCRL
-	if coversCA, ok := idpCRLScope(c); ok {
-		subscriberCRL = !coversCA
+	switch scope, err := idpCRLScope(c); {
+	case err != nil:
+		return &lint.LintResult{Status: lint.Error, Details: err.Error()}
+	case scope == crlScopeCA:
+		subscriberCRL = false
+	case scope == crlScopeSubscriber:
+		subscriberCRL = true
 	}
 
 	if subscriberCRL {
@@ -98,15 +103,8 @@ func (l *CrlNextUpdateInvalid) Execute(c *x509.RevocationList) *lint.LintResult 
 	return &lint.LintResult{Status: lint.Pass}
 }
 
-// idpCRLScope inspects the CRL's Issuing Distribution Point extension, if
-// present, and reports whether it unambiguously states that the CRL covers only
-// CA certificates (coversCA=true) or only subscriber certificates
-// (coversCA=false). The second return value is false when there is no IDP
-// extension, when it can't be parsed, or when it does not scope itself to
-// either kind of certificate.
-//
-// RFC 5280, Section 5.2.5:
-//
+var errAmbiguousIDPScope = errors.New("IDP does not unambiguously scope the CRL")
+
 //	IssuingDistributionPoint ::= SEQUENCE {
 //	     distributionPoint          [0] DistributionPointName OPTIONAL,
 //	     onlyContainsUserCerts      [1] BOOLEAN DEFAULT FALSE,
@@ -114,44 +112,50 @@ func (l *CrlNextUpdateInvalid) Execute(c *x509.RevocationList) *lint.LintResult 
 //	     onlySomeReasons            [3] ReasonFlags OPTIONAL,
 //	     indirectCRL                [4] BOOLEAN DEFAULT FALSE,
 //	     onlyContainsAttributeCerts [5] BOOLEAN DEFAULT FALSE }
-func idpCRLScope(c *x509.RevocationList) (coversCA bool, ok bool) {
+type issuingDistPoint struct {
+	DistributionPoint     asn1.RawValue  `asn1:"optional,tag:0"`
+	OnlyContainsUserCerts bool           `asn1:"optional,tag:1"`
+	OnlyContainsCACerts   bool           `asn1:"optional,tag:2"`
+	OnlySomeReasons       asn1.BitString `asn1:"optional,tag:3"`
+	IndirectCRL           bool           `asn1:"optional,tag:4"`
+	OnlyContainsAttrCerts bool           `asn1:"optional,tag:5"`
+}
+
+type crlScope int
+
+const (
+	crlScopeUnknown crlScope = iota
+	crlScopeSubscriber
+	crlScopeCA
+)
+
+// idpCRLScope inspects the CRL's Issuing Distribution Point extension, if
+// present, and reports whether it unambiguously scopes the CRL to CA or
+// subscriber certificates. It returns (crlScopeUnknown, nil) when there is
+// no IDP extension, or when it's present but doesn't assert either scope
+// boolean. It returns a non-nil error when the extension can't be parsed,
+// or when it asserts both scope booleans (which BR §7.2.2.1 prohibits).
+func idpCRLScope(c *x509.RevocationList) (crlScope, error) {
 	for _, ext := range c.Extensions {
 		if !ext.Id.Equal(util.IssuingDistOID) {
 			continue
 		}
 
-		var idp asn1.RawValue
+		var idp issuingDistPoint
 		if _, err := asn1.Unmarshal(ext.Value, &idp); err != nil {
-			return false, false
-		}
-		if idp.Tag != asn1.TagSequence {
-			return false, false
+			return crlScopeUnknown, err
 		}
 
-		rest := idp.Bytes
-		for len(rest) > 0 {
-			var field asn1.RawValue
-			var err error
-			rest, err = asn1.Unmarshal(rest, &field)
-			if err != nil {
-				return false, false
-			}
-			// BOOLEAN fields are IMPLICITly tagged context-specific values.
-			if field.Class != asn1.ClassContextSpecific || len(field.Bytes) == 0 {
-				continue
-			}
-			switch field.Tag {
-			case 2: // onlyContainsCACerts
-				if field.Bytes[0] != 0 {
-					return true, true
-				}
-			case 1: // onlyContainsUserCerts
-				if field.Bytes[0] != 0 {
-					return false, true
-				}
-			}
+		switch {
+		case idp.OnlyContainsCACerts && idp.OnlyContainsUserCerts:
+			return crlScopeUnknown, errAmbiguousIDPScope
+		case idp.OnlyContainsCACerts:
+			return crlScopeCA, nil
+		case idp.OnlyContainsUserCerts:
+			return crlScopeSubscriber, nil
+		default:
+			return crlScopeUnknown, nil
 		}
-		return false, false
 	}
-	return false, false
+	return crlScopeUnknown, nil
 }
